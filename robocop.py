@@ -34,24 +34,30 @@ except Exception:
 # Constants
 # ---------------------------------------------------------------------------
 
-W, H = 480, 270
+W, H = 640, 360
 SCALE = 2
 WIN_W, WIN_H = W * SCALE, H * SCALE
 FPS = 60
-GROUND_Y = H - 40
+GROUND_Y = H - 56
 
-# Spectrum-ish palette
+# Modern palette (cyberpunk noir)
 BLACK = (0, 0, 0)
-WHITE = (235, 235, 235)
-CYAN = (0, 220, 220)
-MAGENTA = (220, 0, 220)
-YELLOW = (235, 220, 0)
-RED = (220, 30, 30)
-GREEN = (30, 200, 60)
-BLUE = (40, 90, 220)
-DARK = (15, 18, 30)
-GREY = (110, 110, 120)
-ORANGE = (240, 140, 30)
+WHITE = (240, 244, 250)
+CYAN = (0, 230, 255)
+MAGENTA = (230, 60, 200)
+YELLOW = (255, 220, 70)
+RED = (235, 50, 60)
+GREEN = (60, 230, 110)
+BLUE = (60, 130, 240)
+DARK = (10, 14, 24)
+GREY = (130, 138, 150)
+ORANGE = (255, 150, 40)
+STEEL_LIGHT = (210, 220, 230)
+STEEL_MID = (150, 165, 180)
+STEEL_DARK = (60, 75, 95)
+ARMOR_BLUE = (70, 110, 170)
+ARMOR_HIGH = (180, 210, 240)
+VISOR_GLOW = (60, 255, 240)
 
 WEAPON_AUTO9 = "AUTO-9"
 WEAPON_TRIPLE = "3-WAY"
@@ -149,82 +155,352 @@ class Audio:
 # Drawing helpers
 # ---------------------------------------------------------------------------
 
+# Cached glow surfaces keyed by (radius, colour)
+_GLOW_CACHE: dict[tuple, pygame.Surface] = {}
+
+
+def glow(radius: int, colour: tuple[int, int, int], alpha: int = 180) -> pygame.Surface:
+    key = (radius, colour, alpha)
+    s = _GLOW_CACHE.get(key)
+    if s is not None:
+        return s
+    size = radius * 2 + 2
+    s = pygame.Surface((size, size), pygame.SRCALPHA)
+    for r in range(radius, 0, -1):
+        a = int(alpha * (1 - r / radius) ** 2)
+        pygame.draw.circle(s, (*colour, a), (radius + 1, radius + 1), r)
+    _GLOW_CACHE[key] = s
+    return s
+
+
+def blit_glow(surf: pygame.Surface, pos: tuple[int, int], radius: int,
+              colour: tuple[int, int, int], alpha: int = 180) -> None:
+    g = glow(radius, colour, alpha)
+    surf.blit(g, (pos[0] - radius - 1, pos[1] - radius - 1),
+              special_flags=pygame.BLEND_ADD)
+
+
+def vline_grad(surf: pygame.Surface, x: int, y0: int, y1: int,
+               c0: tuple[int, int, int], c1: tuple[int, int, int]) -> None:
+    if y1 <= y0:
+        return
+    for y in range(y0, y1):
+        t = (y - y0) / max(1, y1 - y0 - 1)
+        c = (int(c0[0] + (c1[0] - c0[0]) * t),
+             int(c0[1] + (c1[1] - c0[1]) * t),
+             int(c0[2] + (c1[2] - c0[2]) * t))
+        surf.set_at((x, y), c)
+
+
+def gradient_rect(surf: pygame.Surface, rect: pygame.Rect,
+                  c0: tuple[int, int, int], c1: tuple[int, int, int]) -> None:
+    h = rect.height
+    strip = pygame.Surface((1, h))
+    for y in range(h):
+        t = y / max(1, h - 1)
+        c = (int(c0[0] + (c1[0] - c0[0]) * t),
+             int(c0[1] + (c1[1] - c0[1]) * t),
+             int(c0[2] + (c1[2] - c0[2]) * t))
+        strip.set_at((0, y), c)
+    strip = pygame.transform.scale(strip, (rect.width, h))
+    surf.blit(strip, rect.topleft)
+
+
 def draw_robocop(surf: pygame.Surface, x: int, y: int, facing: int,
                  walking_phase: float, crouching: bool, flicker: bool) -> None:
-    """Draw RoboCop as composite rectangles. (x, y) is feet-centre."""
+    """Draw RoboCop with shading: silver-blue armor, glowing visor strip.
+    (x, y) is feet-centre."""
     if flicker and int(walking_phase * 20) % 2 == 0:
         return
-    body_col = (190, 195, 205)
-    visor_col = CYAN
-    accent = BLUE
-    h = 22 if crouching else 30
-    top = y - h
-    # Legs
-    leg_off = int(math.sin(walking_phase * 8) * 2) if not crouching else 0
-    pygame.draw.rect(surf, body_col, (x - 5, y - 10, 4, 10 - (8 if crouching else 0)))
-    pygame.draw.rect(surf, body_col, (x + 1, y - 10, 4, 10 - (8 if crouching else 0)))
-    if not crouching:
-        pygame.draw.rect(surf, body_col, (x - 5, y - 10 - leg_off, 4, 2))
-        pygame.draw.rect(surf, body_col, (x + 1, y - 10 + leg_off, 4, 2))
-    # Torso
-    pygame.draw.rect(surf, body_col, (x - 6, top + 6, 12, h - 12))
-    pygame.draw.rect(surf, accent, (x - 6, top + 6, 12, 2))
-    # Head/helmet
-    pygame.draw.rect(surf, body_col, (x - 5, top, 10, 7))
-    # Visor
-    pygame.draw.rect(surf, visor_col, (x - 4, top + 2, 8, 2))
-    # Arm with gun
-    arm_y = top + 8 if not crouching else top + 6
-    if facing >= 0:
-        pygame.draw.rect(surf, body_col, (x + 4, arm_y, 5, 3))
-        pygame.draw.rect(surf, GREY, (x + 8, arm_y, 5, 2))
+
+    f = 1 if facing >= 0 else -1
+    walk = math.sin(walking_phase * 9) if not crouching else 0
+    leg_swing = int(walk * 4)
+    body_lift = int(abs(walk) * 1.2)
+    h_total = 40 if not crouching else 30
+
+    # Soft drop shadow on ground
+    sh = pygame.Surface((26, 6), pygame.SRCALPHA)
+    pygame.draw.ellipse(sh, (0, 0, 0, 120), sh.get_rect())
+    surf.blit(sh, (x - 13, y - 2))
+
+    # Legs (front and back leg with swing)
+    for side, swing in ((-1, leg_swing), (1, -leg_swing)):
+        lx = x + side * 3
+        ltop = y - 14 + body_lift
+        if crouching:
+            ltop = y - 8
+        # Thigh
+        pygame.draw.rect(surf, STEEL_DARK, (lx - 3, ltop, 6, 8))
+        pygame.draw.rect(surf, STEEL_MID, (lx - 3, ltop, 6, 2))
+        # Shin
+        pygame.draw.rect(surf, STEEL_DARK, (lx - 3 + swing // 2, ltop + 7, 6, 8))
+        pygame.draw.rect(surf, STEEL_LIGHT, (lx - 3 + swing // 2, ltop + 7, 1, 8))
+        # Boot
+        pygame.draw.rect(surf, BLACK, (lx - 4 + swing // 2, y - 2, 8, 3))
+        pygame.draw.line(surf, STEEL_MID, (lx - 4 + swing // 2, y - 2),
+                         (lx + 3 + swing // 2, y - 2))
+
+    # Torso (chestplate with light side and dark side)
+    top = y - h_total + body_lift
+    chest_h = 16 if not crouching else 12
+    body_w = 18
+    pygame.draw.rect(surf, ARMOR_BLUE, (x - body_w // 2, top + 6, body_w, chest_h))
+    # Highlight (light side facing direction)
+    pygame.draw.rect(surf, ARMOR_HIGH, (x - body_w // 2, top + 6,
+                                        body_w, 2))
+    pygame.draw.rect(surf, STEEL_LIGHT,
+                     (x + (body_w // 2 - 2) * f, top + 6, 2, chest_h))
+    # Shadow side
+    pygame.draw.rect(surf, STEEL_DARK,
+                     (x - (body_w // 2) * f, top + 6, 2, chest_h))
+    # Sternum line
+    pygame.draw.line(surf, STEEL_DARK, (x, top + 8), (x, top + 6 + chest_h - 2))
+    # Belt
+    pygame.draw.rect(surf, STEEL_DARK, (x - body_w // 2, top + 6 + chest_h - 2, body_w, 2))
+
+    # Shoulders (rounded)
+    pygame.draw.circle(surf, STEEL_MID, (x - body_w // 2 + 1, top + 7), 4)
+    pygame.draw.circle(surf, STEEL_MID, (x + body_w // 2 - 1, top + 7), 4)
+    pygame.draw.circle(surf, STEEL_LIGHT, (x - body_w // 2 + 1, top + 6), 2)
+    pygame.draw.circle(surf, STEEL_LIGHT, (x + body_w // 2 - 1, top + 6), 2)
+
+    # Head / helmet
+    helm_w = 12
+    pygame.draw.rect(surf, STEEL_LIGHT, (x - helm_w // 2, top, helm_w, 8))
+    pygame.draw.rect(surf, STEEL_DARK, (x - helm_w // 2, top + 7, helm_w, 1))
+    # Helmet top highlight
+    pygame.draw.rect(surf, WHITE, (x - helm_w // 2 + 2, top, helm_w - 4, 1))
+    # Jaw / chin
+    pygame.draw.rect(surf, (220, 200, 180), (x - 3, top + 6, 6, 3))
+    # Visor strip with glow
+    visor_rect = (x - helm_w // 2 + 1, top + 3, helm_w - 2, 2)
+    pygame.draw.rect(surf, VISOR_GLOW, visor_rect)
+    blit_glow(surf, (x, top + 4), 6, VISOR_GLOW, alpha=200)
+
+    # Arm + Auto-9
+    arm_y = top + 9 + body_lift if not crouching else top + 7
+    if f >= 0:
+        # Upper arm
+        pygame.draw.rect(surf, ARMOR_BLUE, (x + body_w // 2 - 1, arm_y - 1, 5, 5))
+        pygame.draw.rect(surf, ARMOR_HIGH, (x + body_w // 2 - 1, arm_y - 1, 5, 1))
+        # Forearm
+        pygame.draw.rect(surf, STEEL_MID, (x + body_w // 2 + 3, arm_y, 4, 4))
+        # Auto-9
+        gx = x + body_w // 2 + 6
+        pygame.draw.rect(surf, (35, 35, 40), (gx, arm_y, 9, 3))
+        pygame.draw.rect(surf, (70, 70, 80), (gx, arm_y, 9, 1))
+        pygame.draw.rect(surf, (35, 35, 40), (gx + 1, arm_y + 3, 3, 2))
     else:
-        pygame.draw.rect(surf, body_col, (x - 9, arm_y, 5, 3))
-        pygame.draw.rect(surf, GREY, (x - 13, arm_y, 5, 2))
+        pygame.draw.rect(surf, ARMOR_BLUE, (x - body_w // 2 - 4, arm_y - 1, 5, 5))
+        pygame.draw.rect(surf, ARMOR_HIGH, (x - body_w // 2 - 4, arm_y - 1, 5, 1))
+        pygame.draw.rect(surf, STEEL_MID, (x - body_w // 2 - 7, arm_y, 4, 4))
+        gx = x - body_w // 2 - 15
+        pygame.draw.rect(surf, (35, 35, 40), (gx, arm_y, 9, 3))
+        pygame.draw.rect(surf, (70, 70, 80), (gx, arm_y, 9, 1))
+        pygame.draw.rect(surf, (35, 35, 40), (gx + 5, arm_y + 3, 3, 2))
 
 
 def draw_punk(surf: pygame.Surface, x: int, y: int, phase: float,
               colour: tuple[int, int, int], facing: int) -> None:
-    pygame.draw.rect(surf, colour, (x - 4, y - 22, 8, 14))
-    pygame.draw.rect(surf, (40, 40, 60), (x - 4, y - 24, 8, 4))  # hair
-    leg_off = int(math.sin(phase * 8) * 2)
-    pygame.draw.rect(surf, (40, 40, 60), (x - 4, y - 10, 3, 10 - leg_off))
-    pygame.draw.rect(surf, (40, 40, 60), (x + 1, y - 10, 3, 10 + leg_off))
-    # Gun
-    gx = x + (4 if facing >= 0 else -9)
-    pygame.draw.rect(surf, GREY, (gx, y - 18, 5, 2))
+    f = 1 if facing >= 0 else -1
+    walk = math.sin(phase * 8)
+    leg_swing = int(walk * 3)
+
+    # Shadow
+    sh = pygame.Surface((20, 5), pygame.SRCALPHA)
+    pygame.draw.ellipse(sh, (0, 0, 0, 110), sh.get_rect())
+    surf.blit(sh, (x - 10, y - 2))
+
+    # Legs (denim jeans)
+    jeans = (40, 55, 100)
+    jeans_dark = (20, 30, 60)
+    pygame.draw.rect(surf, jeans, (x - 4, y - 12, 4, 12 - leg_swing))
+    pygame.draw.rect(surf, jeans, (x + 0, y - 12, 4, 12 + leg_swing))
+    pygame.draw.rect(surf, jeans_dark, (x - 4, y - 12, 1, 12))
+    pygame.draw.rect(surf, jeans_dark, (x + 0, y - 12, 1, 12))
+    # Boots
+    pygame.draw.rect(surf, BLACK, (x - 5, y - 1, 5, 2))
+    pygame.draw.rect(surf, BLACK, (x + 0, y - 1, 5, 2))
+
+    # Torso (leather jacket)
+    jacket = colour
+    jacket_dark = tuple(max(0, c - 60) for c in colour)
+    jacket_light = tuple(min(255, c + 50) for c in colour)
+    pygame.draw.rect(surf, jacket, (x - 6, y - 24, 12, 13))
+    pygame.draw.rect(surf, jacket_light, (x - 6, y - 24, 12, 2))
+    pygame.draw.rect(surf, jacket_dark, (x + 4 * f, y - 24, 2, 13))
+    # Zipper
+    pygame.draw.line(surf, (200, 200, 80), (x, y - 22), (x, y - 13))
+
+    # Head
+    skin = (220, 190, 160)
+    pygame.draw.rect(surf, skin, (x - 4, y - 30, 8, 6))
+    pygame.draw.rect(surf, (160, 130, 100), (x - 4, y - 25, 8, 1))
+    # Hair (mohawk)
+    hair = (30, 30, 40)
+    pygame.draw.rect(surf, hair, (x - 4, y - 32, 8, 3))
+    pygame.draw.rect(surf, hair, (x - 1, y - 34, 2, 2))
+    # Eyes
+    pygame.draw.rect(surf, RED, (x - 2 + (1 if f > 0 else -2), y - 29, 1, 1))
+    pygame.draw.rect(surf, RED, (x + 1 + (1 if f > 0 else -2), y - 29, 1, 1))
+
+    # Pistol
+    gx = x + (5 if f > 0 else -10)
+    pygame.draw.rect(surf, (40, 40, 50), (gx, y - 20, 6, 2))
+    pygame.draw.rect(surf, (80, 80, 90), (gx, y - 20, 6, 1))
+
+
+def draw_heavy(surf: pygame.Surface, x: int, y: int, phase: float, facing: int) -> None:
+    """Armoured swat-like thug."""
+    f = 1 if facing >= 0 else -1
+    walk = math.sin(phase * 6)
+    leg_swing = int(walk * 3)
+    sh = pygame.Surface((24, 5), pygame.SRCALPHA)
+    pygame.draw.ellipse(sh, (0, 0, 0, 120), sh.get_rect())
+    surf.blit(sh, (x - 12, y - 2))
+    # Legs
+    pygame.draw.rect(surf, (40, 50, 50), (x - 5, y - 12, 4, 12 - leg_swing))
+    pygame.draw.rect(surf, (40, 50, 50), (x + 1, y - 12, 4, 12 + leg_swing))
+    pygame.draw.rect(surf, BLACK, (x - 6, y - 1, 6, 2))
+    pygame.draw.rect(surf, BLACK, (x + 0, y - 1, 6, 2))
+    # Body armour
+    body = (55, 80, 60)
+    bodyL = (90, 130, 95)
+    bodyD = (30, 45, 35)
+    pygame.draw.rect(surf, body, (x - 8, y - 26, 16, 15))
+    pygame.draw.rect(surf, bodyL, (x - 8, y - 26, 16, 2))
+    pygame.draw.rect(surf, bodyD, (x + (6 * f), y - 26, 2, 15))
+    # Vest pockets
+    pygame.draw.rect(surf, bodyD, (x - 6, y - 22, 4, 3))
+    pygame.draw.rect(surf, bodyD, (x + 2, y - 22, 4, 3))
+    # Helmet (full visor)
+    pygame.draw.rect(surf, (35, 35, 40), (x - 5, y - 33, 10, 8))
+    pygame.draw.rect(surf, (60, 60, 65), (x - 5, y - 33, 10, 1))
+    pygame.draw.rect(surf, (180, 50, 50), (x - 4, y - 31, 8, 2))
+    blit_glow(surf, (x, y - 30), 5, (220, 60, 60), alpha=140)
+    # Rifle
+    if f > 0:
+        pygame.draw.rect(surf, (30, 30, 35), (x + 6, y - 22, 12, 2))
+        pygame.draw.rect(surf, (60, 60, 65), (x + 6, y - 22, 12, 1))
+        pygame.draw.rect(surf, (30, 30, 35), (x + 4, y - 23, 4, 4))
+    else:
+        pygame.draw.rect(surf, (30, 30, 35), (x - 18, y - 22, 12, 2))
+        pygame.draw.rect(surf, (60, 60, 65), (x - 18, y - 22, 12, 1))
+        pygame.draw.rect(surf, (30, 30, 35), (x - 8, y - 23, 4, 4))
 
 
 def draw_ed209(surf: pygame.Surface, x: int, y: int, phase: float) -> None:
-    body = (170, 110, 30)
-    dark = (90, 60, 15)
-    # Legs
-    sway = int(math.sin(phase * 4) * 3)
-    pygame.draw.rect(surf, dark, (x - 18, y - 24, 8, 24 + sway))
-    pygame.draw.rect(surf, dark, (x + 10, y - 24, 8, 24 - sway))
-    pygame.draw.polygon(surf, dark, [(x - 22, y), (x - 6, y), (x - 14, y + 4)])
-    pygame.draw.polygon(surf, dark, [(x + 6, y), (x + 22, y), (x + 14, y + 4)])
-    # Body
-    pygame.draw.rect(surf, body, (x - 20, y - 44, 40, 22))
-    pygame.draw.rect(surf, dark, (x - 20, y - 44, 40, 4))
-    # Head/sensors
-    pygame.draw.rect(surf, body, (x - 10, y - 56, 20, 12))
-    pygame.draw.rect(surf, RED, (x - 7, y - 52, 4, 3))
-    pygame.draw.rect(surf, RED, (x + 3, y - 52, 4, 3))
-    # Gun arms
-    pygame.draw.rect(surf, dark, (x - 30, y - 38, 12, 6))
-    pygame.draw.rect(surf, dark, (x + 18, y - 38, 12, 6))
+    body = (180, 130, 50)
+    body_high = (240, 200, 120)
+    body_low = (110, 70, 20)
+    dark = (60, 40, 10)
+    # Shadow
+    sh = pygame.Surface((80, 10), pygame.SRCALPHA)
+    pygame.draw.ellipse(sh, (0, 0, 0, 150), sh.get_rect())
+    surf.blit(sh, (x - 40, y - 4))
+    # Legs (chicken-walker)
+    sway = int(math.sin(phase * 3) * 4)
+    for side, off in ((-1, sway), (1, -sway)):
+        lx = x + side * 14
+        # Thigh
+        pygame.draw.polygon(surf, body_low,
+                            [(lx - 6, y - 50), (lx + 6, y - 50),
+                             (lx + 8, y - 30), (lx - 8, y - 30)])
+        pygame.draw.line(surf, body_high, (lx - 6, y - 50), (lx - 6, y - 30))
+        # Shin
+        pygame.draw.rect(surf, dark, (lx - 4, y - 30, 8, 22 + off))
+        pygame.draw.rect(surf, body_low, (lx - 4, y - 30, 2, 22 + off))
+        # Claw foot
+        pygame.draw.polygon(surf, dark,
+                            [(lx - 10, y), (lx + 10, y),
+                             (lx + 8, y + 5), (lx, y + 4), (lx - 8, y + 5)])
+        pygame.draw.line(surf, body_high, (lx - 6, y + 1), (lx + 6, y + 1))
+    # Hip pivot
+    pygame.draw.ellipse(surf, body_low, (x - 18, y - 56, 36, 14))
+    # Main torso
+    pygame.draw.polygon(surf, body,
+                        [(x - 26, y - 76), (x + 26, y - 76),
+                         (x + 32, y - 52), (x - 32, y - 52)])
+    pygame.draw.polygon(surf, body_high,
+                        [(x - 26, y - 76), (x + 26, y - 76),
+                         (x + 22, y - 72), (x - 22, y - 72)])
+    pygame.draw.polygon(surf, body_low,
+                        [(x - 32, y - 52), (x + 32, y - 52),
+                         (x + 26, y - 56), (x - 26, y - 56)])
+    # Panel lines
+    pygame.draw.line(surf, dark, (x - 18, y - 76), (x - 22, y - 52))
+    pygame.draw.line(surf, dark, (x + 18, y - 76), (x + 22, y - 52))
+    pygame.draw.line(surf, dark, (x, y - 76), (x, y - 52))
+    # Shoulders (rotary cannons / missile pods)
+    for side in (-1, 1):
+        sx = x + side * 32
+        pygame.draw.rect(surf, body_low, (sx - 8, y - 70, 16, 14))
+        pygame.draw.rect(surf, body_high, (sx - 8, y - 70, 16, 2))
+        # Gun barrels
+        bx = sx + side * 8
+        pygame.draw.rect(surf, dark, (bx if side > 0 else bx - 14, y - 66, 14, 4))
+        pygame.draw.circle(surf, BLACK,
+                           (bx + (12 if side > 0 else -12), y - 64), 2)
+    # Head/sensor cluster
+    pygame.draw.polygon(surf, body,
+                        [(x - 14, y - 92), (x + 14, y - 92),
+                         (x + 18, y - 78), (x - 18, y - 78)])
+    pygame.draw.polygon(surf, body_high,
+                        [(x - 14, y - 92), (x + 14, y - 92),
+                         (x + 10, y - 90), (x - 10, y - 90)])
+    # Twin sensor eyes
+    pygame.draw.rect(surf, (40, 0, 0), (x - 10, y - 86, 7, 5))
+    pygame.draw.rect(surf, (40, 0, 0), (x + 3, y - 86, 7, 5))
+    pygame.draw.rect(surf, RED, (x - 9, y - 85, 5, 3))
+    pygame.draw.rect(surf, RED, (x + 4, y - 85, 5, 3))
+    blit_glow(surf, (x - 7, y - 84), 6, RED, alpha=200)
+    blit_glow(surf, (x + 6, y - 84), 6, RED, alpha=200)
+    # Antennae
+    pygame.draw.line(surf, dark, (x - 8, y - 92), (x - 10, y - 100))
+    pygame.draw.line(surf, dark, (x + 8, y - 92), (x + 10, y - 100))
 
 
 def draw_boddicker(surf: pygame.Surface, x: int, y: int, phase: float, facing: int) -> None:
-    pygame.draw.rect(surf, (60, 60, 80), (x - 6, y - 26, 12, 16))
-    pygame.draw.rect(surf, (220, 200, 170), (x - 4, y - 30, 8, 5))  # face
-    pygame.draw.rect(surf, (180, 180, 180), (x - 4, y - 31, 8, 2))  # glasses
-    leg_off = int(math.sin(phase * 8) * 2)
-    pygame.draw.rect(surf, (40, 40, 60), (x - 5, y - 10, 4, 10 - leg_off))
-    pygame.draw.rect(surf, (40, 40, 60), (x + 1, y - 10, 4, 10 + leg_off))
-    gx = x + (5 if facing >= 0 else -11)
-    pygame.draw.rect(surf, GREY, (gx, y - 20, 6, 3))
+    f = 1 if facing >= 0 else -1
+    walk = math.sin(phase * 8)
+    leg_swing = int(walk * 3)
+    sh = pygame.Surface((22, 5), pygame.SRCALPHA)
+    pygame.draw.ellipse(sh, (0, 0, 0, 130), sh.get_rect())
+    surf.blit(sh, (x - 11, y - 2))
+    # Pants
+    pygame.draw.rect(surf, (30, 30, 35), (x - 5, y - 14, 4, 14 - leg_swing))
+    pygame.draw.rect(surf, (30, 30, 35), (x + 1, y - 14, 4, 14 + leg_swing))
+    pygame.draw.rect(surf, BLACK, (x - 6, y - 1, 6, 2))
+    pygame.draw.rect(surf, BLACK, (x + 0, y - 1, 6, 2))
+    # Suit jacket
+    pygame.draw.rect(surf, (50, 50, 60), (x - 7, y - 28, 14, 16))
+    pygame.draw.rect(surf, (90, 90, 100), (x - 7, y - 28, 14, 2))
+    pygame.draw.rect(surf, (25, 25, 30), (x + (5 * f), y - 28, 2, 16))
+    # Shirt + tie
+    pygame.draw.rect(surf, WHITE, (x - 2, y - 28, 4, 6))
+    pygame.draw.rect(surf, RED, (x - 1, y - 26, 2, 8))
+    # Head
+    skin = (220, 190, 160)
+    pygame.draw.rect(surf, skin, (x - 5, y - 36, 10, 8))
+    pygame.draw.rect(surf, (170, 140, 110), (x - 5, y - 29, 10, 1))
+    # Hair (slicked back, blond)
+    pygame.draw.rect(surf, (200, 180, 90), (x - 5, y - 38, 10, 3))
+    pygame.draw.rect(surf, (160, 140, 60), (x - 5, y - 38, 10, 1))
+    # Glasses
+    pygame.draw.rect(surf, BLACK, (x - 5, y - 33, 4, 2))
+    pygame.draw.rect(surf, BLACK, (x + 1, y - 33, 4, 2))
+    pygame.draw.line(surf, BLACK, (x - 1, y - 32), (x + 1, y - 32))
+    blit_glow(surf, (x, y - 32), 4, (180, 200, 220), alpha=70)
+    # Shotgun
+    if f > 0:
+        pygame.draw.rect(surf, (40, 20, 10), (x + 6, y - 22, 14, 3))
+        pygame.draw.rect(surf, (70, 40, 20), (x + 6, y - 22, 14, 1))
+        pygame.draw.rect(surf, (40, 40, 50), (x + 18, y - 22, 4, 3))
+    else:
+        pygame.draw.rect(surf, (40, 20, 10), (x - 20, y - 22, 14, 3))
+        pygame.draw.rect(surf, (70, 40, 20), (x - 20, y - 22, 14, 1))
+        pygame.draw.rect(surf, (40, 40, 50), (x - 22, y - 22, 4, 3))
 
 
 # ---------------------------------------------------------------------------
@@ -318,12 +594,12 @@ class Enemy:
     @property
     def rect(self) -> pygame.Rect:
         if self.kind == "ed209":
-            return pygame.Rect(int(self.x - 22), int(self.y - 56), 44, 56)
+            return pygame.Rect(int(self.x - 34), int(self.y - 100), 68, 100)
         if self.kind == "boddicker":
-            return pygame.Rect(int(self.x - 7), int(self.y - 32), 14, 32)
+            return pygame.Rect(int(self.x - 8), int(self.y - 36), 16, 36)
         if self.kind == "drone":
-            return pygame.Rect(int(self.x - 10), int(self.y - 8), 20, 16)
-        return pygame.Rect(int(self.x - 5), int(self.y - 26), 10, 26)
+            return pygame.Rect(int(self.x - 12), int(self.y - 10), 24, 18)
+        return pygame.Rect(int(self.x - 6), int(self.y - 32), 12, 32)
 
     def update(self, dt: float, game: "Game") -> None:
         self.phase += dt
@@ -396,13 +672,29 @@ class Enemy:
         if self.kind == "punk":
             draw_punk(surf, sx, sy, self.phase, self.colour, self.facing)
         elif self.kind == "heavy":
-            draw_punk(surf, sx, sy, self.phase, self.colour, self.facing)
-            pygame.draw.rect(surf, BLACK, (sx - 4, sy - 24, 8, 3))  # helmet band
+            draw_heavy(surf, sx, sy, self.phase, self.facing)
         elif self.kind == "drone":
-            pygame.draw.ellipse(surf, self.colour, (sx - 10, sy - 6, 20, 12))
-            pygame.draw.rect(surf, RED, (sx - 2, sy - 1, 4, 2))
-            pygame.draw.rect(surf, GREY, (sx - 12, sy - 8, 4, 2))
-            pygame.draw.rect(surf, GREY, (sx + 8, sy - 8, 4, 2))
+            # Hover drone with rotor blur + thruster glow
+            bob = int(math.sin(self.phase * 6) * 2)
+            sy2 = sy + bob
+            # Rotor blur
+            rotor = pygame.Surface((36, 4), pygame.SRCALPHA)
+            pygame.draw.ellipse(rotor, (180, 180, 200, 120), rotor.get_rect())
+            surf.blit(rotor, (sx - 18, sy2 - 14))
+            pygame.draw.line(surf, GREY, (sx - 12, sy2 - 12), (sx + 12, sy2 - 12))
+            # Body
+            pygame.draw.ellipse(surf, (60, 60, 80), (sx - 12, sy2 - 8, 24, 14))
+            pygame.draw.ellipse(surf, (110, 110, 140), (sx - 12, sy2 - 8, 24, 6))
+            pygame.draw.rect(surf, self.colour, (sx - 8, sy2 - 4, 16, 4))
+            # Eye
+            pygame.draw.rect(surf, RED, (sx - 2, sy2 - 1, 4, 2))
+            blit_glow(surf, (sx, sy2), 5, RED, alpha=160)
+            # Thrusters
+            tcol = (255, 180, 60)
+            pygame.draw.rect(surf, tcol, (sx - 10, sy2 + 5, 4, 3))
+            pygame.draw.rect(surf, tcol, (sx + 6, sy2 + 5, 4, 3))
+            blit_glow(surf, (sx - 8, sy2 + 8), 5, tcol, alpha=180)
+            blit_glow(surf, (sx + 8, sy2 + 8), 5, tcol, alpha=180)
         elif self.kind == "boddicker":
             draw_boddicker(surf, sx, sy, self.phase, self.facing)
         elif self.kind == "ed209":
@@ -434,8 +726,8 @@ class Enemy:
 
 
 class Player:
-    WIDTH = 12
-    HEIGHT = 30
+    WIDTH = 16
+    HEIGHT = 38
 
     def __init__(self):
         self.x = 60.0
@@ -678,10 +970,12 @@ class Game:
         pygame.display.set_caption("RoboCop - Python")
         self.screen = pygame.Surface((W, H))
         self.clock = pygame.time.Clock()
-        self.font = pygame.font.SysFont("couriernew", 12, bold=True)
-        self.big = pygame.font.SysFont("couriernew", 28, bold=True)
-        self.huge = pygame.font.SysFont("couriernew", 48, bold=True)
+        self.font = pygame.font.SysFont("couriernew", 14, bold=True)
+        self.big = pygame.font.SysFont("couriernew", 22, bold=True)
+        self.huge = pygame.font.SysFont("couriernew", 40, bold=True)
         self.audio = Audio()
+        self.scanline_overlay = self._build_scanlines()
+        self.vignette = self._build_vignette()
 
         self.state = "TITLE"
         self.state_t = 0.0
@@ -713,10 +1007,40 @@ class Game:
         self.message: tuple[str, float] | None = None
 
         self.start_stage(0)
+        self.set_state("TITLE")
 
     # ------------------------------------------------------------------
     # State / stage management
     # ------------------------------------------------------------------
+
+    def _build_scanlines(self) -> pygame.Surface:
+        surf = pygame.Surface((W, H), pygame.SRCALPHA)
+        for y in range(0, H, 2):
+            pygame.draw.line(surf, (0, 0, 0, 60), (0, y), (W, y))
+        # Subtle blue chroma every 6 lines
+        for y in range(0, H, 6):
+            pygame.draw.line(surf, (0, 40, 80, 30), (0, y + 1), (W, y + 1))
+        return surf
+
+    def _build_vignette(self) -> pygame.Surface:
+        surf = pygame.Surface((W, H), pygame.SRCALPHA)
+        cx, cy = W / 2, H / 2
+        maxd = math.hypot(cx, cy)
+        # Per-pixel radial darken (cached once, so cost is acceptable)
+        for y in range(0, H, 2):
+            for x in range(0, W, 2):
+                d = math.hypot(x - cx, y - cy) / maxd
+                a = int(max(0.0, (d - 0.55)) * 240)
+                a = min(180, a)
+                if a > 0:
+                    surf.set_at((x, y), (0, 0, 0, a))
+                    if x + 1 < W:
+                        surf.set_at((x + 1, y), (0, 0, 0, a))
+                    if y + 1 < H:
+                        surf.set_at((x, y + 1), (0, 0, 0, a))
+                        if x + 1 < W:
+                            surf.set_at((x + 1, y + 1), (0, 0, 0, a))
+        return surf
 
     def set_state(self, s: str) -> None:
         self.state = s
@@ -1035,6 +1359,12 @@ class Game:
         elif self.state == "ENDING":
             self._draw_ending(s)
 
+        # Vignette + scanlines overlay
+        if self.scanline_overlay is not None:
+            s.blit(self.scanline_overlay, (0, 0))
+        if self.vignette is not None:
+            s.blit(self.vignette, (0, 0))
+
         # Shake
         ox, oy = 0, 0
         if self.shake_t > 0:
@@ -1050,32 +1380,106 @@ class Game:
         surf.blit(img, (W // 2 - img.get_width() // 2, H // 2 - img.get_height() // 2 + dy))
 
     def _draw_title(self, s: pygame.Surface) -> None:
-        s.fill(BLACK)
-        # Scanline background
-        for i in range(0, H, 4):
-            pygame.draw.line(s, (10, 10, 25), (0, i), (W, i))
+        # Animated gradient background
+        gradient_rect(s, pygame.Rect(0, 0, W, H), (5, 8, 25), (25, 10, 45))
+        # Distant city silhouette
+        for i in range(0, W, 30):
+            bh = 40 + ((i * 7) % 80)
+            pygame.draw.rect(s, (15, 18, 35), (i, H - 60 - bh, 28, bh + 60))
+            for wy in range(H - 60 - bh + 6, H - 70, 8):
+                if ((i + wy) // 8) % 3 == 0:
+                    pygame.draw.rect(s, (180, 200, 240), (i + 6, wy, 2, 3))
+                    pygame.draw.rect(s, (240, 200, 100), (i + 16, wy, 2, 3))
+        # Grid floor (perspective)
+        horizon = H - 80
+        for i in range(-10, 11):
+            xtop = W // 2 + i * 30
+            xbot = W // 2 + i * 180
+            pygame.draw.line(s, (40, 100, 180), (xtop, horizon), (xbot, H))
+        for j in range(1, 9):
+            y = horizon + j * j * 1.4
+            pygame.draw.line(s, (40, 100, 180), (0, int(y)), (W, int(y)))
+
+        # ROBOCOP title with strong glow
         title = self.huge.render("ROBOCOP", False, CYAN)
-        s.blit(title, (W // 2 - title.get_width() // 2, 40))
-        sub = self.font.render("PYTHON EDITION  -  inspired by Ocean / Data East 1988",
-                               False, MAGENTA)
+        # Soft horizontal glow band behind the title
+        band = pygame.Surface((title.get_width() + 80, title.get_height() + 24),
+                              pygame.SRCALPHA)
+        for i in range(8, 0, -1):
+            a = 18 if i > 4 else 28
+            pygame.draw.ellipse(band, (0, 200, 220, a),
+                                (8 - i * 2, 8 - i, band.get_width() - 16 + i * 4,
+                                 band.get_height() - 16 + i * 2))
+        s.blit(band, (W // 2 - band.get_width() // 2, 20))
+        # Shadow layers
+        for off in (4, 3, 2):
+            t = self.huge.render("ROBOCOP", False, (0, 80, 120))
+            s.blit(t, (W // 2 - title.get_width() // 2 + off, 30 + off))
+        s.blit(title, (W // 2 - title.get_width() // 2, 28))
+        # Magenta underline
+        uy = 28 + title.get_height() - 2
+        pygame.draw.rect(s, MAGENTA, (W // 2 - title.get_width() // 2,
+                                      uy, title.get_width(), 2))
+
+        sub = self.font.render(
+            "PYTHON EDITION  -  inspired by Ocean / Data East 1988",
+            False, MAGENTA)
         s.blit(sub, (W // 2 - sub.get_width() // 2, 90))
-        # Big rectangle robocop
-        draw_robocop(s, W // 2, 200, 1, self.state_t, False, False)
-        # Stats / blink
+
+        # Robocop centre with floor light
+        rx = W // 2
+        ry = H - 70
+        # Spotlight
+        spot = pygame.Surface((140, 30), pygame.SRCALPHA)
+        pygame.draw.ellipse(spot, (60, 220, 240, 80), spot.get_rect())
+        s.blit(spot, (rx - 70, ry - 4))
+        draw_robocop(s, rx, ry, 1, self.state_t * 0.3, False, False)
+        # Side punks (decorative)
+        draw_punk(s, rx - 90, ry, self.state_t * 0.3, (180, 60, 60), 1)
+        draw_punk(s, rx + 90, ry, self.state_t * 0.3 + 1, (60, 100, 180), -1)
+
+        # Blinking prompt
         if int(self.state_t * 2) % 2 == 0:
-            press = self.font.render("PRESS ENTER TO SERVE THE PUBLIC TRUST",
+            press = self.font.render("PRESS  ENTER  TO  SERVE  THE  PUBLIC  TRUST",
                                      False, YELLOW)
-            s.blit(press, (W // 2 - press.get_width() // 2, 230))
-        ctrl = self.font.render("ARROWS move  SPACE fire  Z jump  DOWN crouch",
-                                False, WHITE)
-        s.blit(ctrl, (W // 2 - ctrl.get_width() // 2, 250))
+            # Tight glow band behind the text
+            pw = press.get_width()
+            ph = press.get_height()
+            gb = pygame.Surface((pw + 24, ph + 8), pygame.SRCALPHA)
+            for i in range(4, 0, -1):
+                pygame.draw.rect(gb, (255, 220, 70, 25),
+                                 (12 - i * 2, 4 - i, pw + i * 4, ph + i * 2),
+                                 border_radius=4)
+            s.blit(gb, (W // 2 - gb.get_width() // 2, H - 36))
+            s.blit(press, (W // 2 - press.get_width() // 2, H - 32))
+        ctrl = self.font.render(
+            "ARROWS move  -  SPACE fire  -  Z jump  -  DOWN crouch",
+            False, WHITE)
+        s.blit(ctrl, (W // 2 - ctrl.get_width() // 2, H - 16))
 
     def _draw_stage_intro(self, s: pygame.Surface) -> None:
-        s.fill(BLACK)
-        self._draw_centre_text(s, f"STAGE {self.stage_index + 1}", self.big, CYAN, -30)
-        self._draw_centre_text(s, self.stage.name, self.huge, WHITE, 10)
-        self._draw_centre_text(s, "PRESS ENTER", self.font, YELLOW, 60)
-        # Three Prime Directives
+        gradient_rect(s, pygame.Rect(0, 0, W, H), (5, 8, 20), (15, 10, 30))
+        # Subtle scan grid
+        for y in range(0, H, 8):
+            pygame.draw.line(s, (12, 16, 30), (0, y), (W, y))
+        # Big stage number with shadow
+        big_n = self.huge.render(f"STAGE {self.stage_index + 1}", False, CYAN)
+        sh = self.huge.render(f"STAGE {self.stage_index + 1}", False, (0, 80, 100))
+        s.blit(sh, (W // 2 - big_n.get_width() // 2 + 3, H // 2 - 67))
+        s.blit(big_n, (W // 2 - big_n.get_width() // 2, H // 2 - 70))
+        name = self.huge.render(self.stage.name, False, WHITE)
+        s.blit(name, (W // 2 - name.get_width() // 2, H // 2 - 20))
+        # Underline
+        pygame.draw.rect(s, MAGENTA,
+                         (W // 2 - name.get_width() // 2,
+                          H // 2 - 20 + name.get_height(),
+                          name.get_width(), 2))
+        # Prime directives panel
+        panel_rect = pygame.Rect(W // 2 - 140, H // 2 + 40, 280, 70)
+        panel = pygame.Surface(panel_rect.size, pygame.SRCALPHA)
+        panel.fill((0, 0, 0, 160))
+        s.blit(panel, panel_rect.topleft)
+        pygame.draw.rect(s, CYAN, panel_rect, 1)
         dirs = [
             "1. SERVE THE PUBLIC TRUST",
             "2. PROTECT THE INNOCENT",
@@ -1083,33 +1487,124 @@ class Game:
         ]
         for i, d in enumerate(dirs):
             img = self.font.render(d, False, MAGENTA)
-            s.blit(img, (W // 2 - img.get_width() // 2, 200 + i * 14))
+            s.blit(img, (panel_rect.x + 14, panel_rect.y + 8 + i * 18))
+        if int(self.state_t * 2) % 2 == 0:
+            self._draw_centre_text(s, "PRESS ENTER", self.font, YELLOW, 130)
 
     def _draw_play(self, s: pygame.Surface) -> None:
         far, mid, near = self.stage.palette
-        s.fill(far)
-        # Parallax skyline
         cam = self.cam_x
-        for i in range(-1, W // 30 + 2):
-            bx = (i * 40 - int(cam * 0.2) % 40)
-            pygame.draw.rect(s, mid, (bx, GROUND_Y - 90, 30, 90))
-            pygame.draw.rect(s, far, (bx + 6, GROUND_Y - 80, 4, 4))
-            pygame.draw.rect(s, far, (bx + 16, GROUND_Y - 70, 4, 4))
-        for i in range(-1, W // 50 + 2):
-            bx = (i * 60 - int(cam * 0.5) % 60)
-            pygame.draw.rect(s, near, (bx, GROUND_Y - 60, 50, 60))
-            for wy in range(0, 50, 10):
-                pygame.draw.rect(s, mid, (bx + 4, GROUND_Y - 56 + wy, 6, 4))
-                pygame.draw.rect(s, mid, (bx + 14, GROUND_Y - 56 + wy, 6, 4))
-                pygame.draw.rect(s, mid, (bx + 24, GROUND_Y - 56 + wy, 6, 4))
-                pygame.draw.rect(s, mid, (bx + 34, GROUND_Y - 56 + wy, 6, 4))
-        # Ground
-        pygame.draw.rect(s, (40, 40, 50), (0, GROUND_Y, W, H - GROUND_Y))
-        for i in range(-1, W // 16 + 2):
-            x = i * 20 - int(cam) % 20
-            pygame.draw.line(s, (70, 70, 90), (x, GROUND_Y), (x, H), 1)
+        stage_id = self.stage_index
 
-        # Power-ups
+        # ---- Sky / atmosphere ----
+        sky_top = (max(0, far[0] // 3), max(0, far[1] // 3), max(0, far[2] // 3 + 10))
+        sky_bot = far
+        gradient_rect(s, pygame.Rect(0, 0, W, GROUND_Y), sky_top, sky_bot)
+
+        # Stars / haze (only stages 0 and 3)
+        if stage_id in (0, 3):
+            for i in range(40):
+                sx = (i * 53 - int(cam * 0.05)) % W
+                sy = (i * 17) % (GROUND_Y - 60)
+                a = 100 + (i * 31) % 120
+                s.set_at((sx, sy), (a, a, min(255, a + 30)))
+
+        # Moon / sun (stage 0 moon, stage 1 sun, stage 2 hazy sun, stage 3 floodlight)
+        if stage_id == 0:
+            mx = (W - 90 - int(cam * 0.05)) % (W + 200) - 100
+            blit_glow(s, (mx, 60), 30, (210, 220, 240), alpha=90)
+            pygame.draw.circle(s, (230, 230, 240), (mx, 60), 14)
+            pygame.draw.circle(s, (200, 200, 215), (mx + 4, 57), 12)
+        elif stage_id == 1:
+            sx = 90
+            blit_glow(s, (sx, 70), 40, (255, 180, 80), alpha=100)
+            pygame.draw.circle(s, (255, 220, 130), (sx, 70), 16)
+        elif stage_id == 2:
+            blit_glow(s, (W - 100, 80), 50, (255, 160, 80), alpha=90)
+            pygame.draw.circle(s, (240, 160, 90), (W - 100, 80), 18)
+
+        # ---- Far skyline (parallax 0.15) ----
+        for i in range(-1, W // 28 + 4):
+            bx = i * 36 - int(cam * 0.15) % 36
+            bh = 60 + ((i * 17) % 50)
+            top_y = GROUND_Y - bh - 30
+            col = (mid[0] // 3, mid[1] // 3, mid[2] // 3 + 10)
+            pygame.draw.rect(s, col, (bx, top_y, 32, bh + 30))
+            # antenna
+            if i % 3 == 0:
+                pygame.draw.line(s, col, (bx + 16, top_y), (bx + 16, top_y - 8))
+                pygame.draw.circle(s, RED, (bx + 16, top_y - 8), 1)
+
+        # ---- Mid skyline (parallax 0.35) with lit windows ----
+        for i in range(-1, W // 40 + 4):
+            bx = i * 56 - int(cam * 0.35) % 56
+            bh = 80 + ((i * 13) % 70)
+            top_y = GROUND_Y - bh - 12
+            colb = tuple(int(c * 0.55) for c in mid)
+            pygame.draw.rect(s, colb, (bx, top_y, 48, bh + 12))
+            # roof shadow
+            pygame.draw.rect(s, tuple(int(c * 0.35) for c in mid),
+                             (bx, top_y, 48, 3))
+            # lit windows
+            for wy in range(top_y + 8, GROUND_Y - 12, 8):
+                for wx in range(bx + 4, bx + 44, 8):
+                    if ((wx + wy + i) * 7) % 11 < 4:
+                        wcol = (255, 220, 120) if ((wx * wy) % 5) else (200, 210, 240)
+                        pygame.draw.rect(s, wcol, (wx, wy, 3, 4))
+
+        # ---- Near foreground silhouettes (parallax 0.6) ----
+        for i in range(-1, W // 70 + 3):
+            bx = i * 110 - int(cam * 0.6) % 110
+            bh = 50 + ((i * 23) % 40)
+            top_y = GROUND_Y - bh
+            colb = tuple(int(c * 0.4) for c in near)
+            pygame.draw.rect(s, colb, (bx, top_y, 90, bh))
+            # Neon signs (stage-dependent)
+            if i % 2 == 0:
+                sign_col = (CYAN if stage_id == 0 else MAGENTA
+                            if stage_id == 1 else YELLOW if stage_id == 2 else CYAN)
+                pygame.draw.rect(s, sign_col, (bx + 20, top_y + 12, 30, 6))
+                blit_glow(s, (bx + 35, top_y + 15), 14, sign_col, alpha=140)
+            for wy in range(top_y + 4, GROUND_Y - 4, 6):
+                for wx in range(bx + 2, bx + 88, 6):
+                    if ((wx + wy) // 6 + i) % 4 == 0:
+                        pygame.draw.rect(s, (255, 200, 80), (wx, wy, 2, 3))
+
+        # ---- Ground ----
+        gradient_rect(s, pygame.Rect(0, GROUND_Y, W, H - GROUND_Y),
+                      (35, 38, 50), (12, 14, 22))
+        # Floor reflection of skyline (very faint)
+        for i in range(-1, W // 50 + 3):
+            bx = i * 56 - int(cam * 0.35) % 56
+            colb = tuple(int(c * 0.18) for c in mid)
+            pygame.draw.rect(s, colb, (bx, GROUND_Y + 1, 48, 6))
+        # Lane lines / road markings
+        for i in range(-1, W // 22 + 2):
+            x = i * 28 - int(cam) % 28
+            pygame.draw.rect(s, (220, 200, 60), (x, GROUND_Y + 18, 14, 2))
+        # Curb
+        pygame.draw.line(s, (90, 95, 110), (0, GROUND_Y), (W, GROUND_Y))
+        pygame.draw.line(s, (160, 165, 180), (0, GROUND_Y + 1), (W, GROUND_Y + 1))
+
+        # Rain (stage 0 + 3) — deterministic streaks falling
+        if stage_id in (0, 3):
+            t = self.state_t
+            for i in range(80):
+                base_x = (i * 71) % W
+                base_y = (i * 53) % H
+                rx = int((base_x - cam * 0.4) % W)
+                ry = int((base_y + t * 400) % H)
+                pygame.draw.line(s, (160, 180, 220),
+                                 (rx, ry), (rx - 2, ry + 6))
+        # Dust / embers (stage 1 + 2)
+        elif stage_id in (1, 2):
+            for i in range(30):
+                rx = (i * 47 - int(self.state_t * 30)) % W
+                ry = (i * 31 + int(math.sin(self.state_t + i) * 10)) % GROUND_Y
+                col = (255, 180, 80) if stage_id == 2 else (180, 200, 200)
+                s.set_at((rx, ry), col)
+
+        # ---- Power-ups (glowing crates) ----
         for p in self.powerups:
             sx = int(p.x - cam)
             sy = int(p.y)
@@ -1118,70 +1613,146 @@ class Game:
                 WEAPON_TRIPLE: CYAN, WEAPON_RAPID: WHITE,
                 WEAPON_COBRA: ORANGE, "health": GREEN,
             }.get(p.kind, YELLOW)
-            pygame.draw.rect(s, col, (sx - 6, sy - 12 + bob, 12, 12))
+            blit_glow(s, (sx, sy - 6 + bob), 12, col, alpha=160)
+            pygame.draw.rect(s, (30, 30, 40), (sx - 7, sy - 13 + bob, 14, 13))
+            pygame.draw.rect(s, col, (sx - 6, sy - 12 + bob, 12, 11))
+            pygame.draw.rect(s, WHITE, (sx - 6, sy - 12 + bob, 12, 2))
+            pygame.draw.rect(s, tuple(max(0, c - 80) for c in col),
+                             (sx - 6, sy - 4 + bob, 12, 2))
             label = {WEAPON_TRIPLE: "3", WEAPON_RAPID: "R",
                      WEAPON_COBRA: "C", "health": "+"}.get(p.kind, "?")
             img = self.font.render(label, False, BLACK)
-            s.blit(img, (sx - img.get_width() // 2, sy - 12 + bob))
+            s.blit(img, (sx - img.get_width() // 2, sy - 11 + bob))
 
-        # Enemies
+        # ---- Enemies ----
         for e in self.enemies:
             e.draw(s, int(cam))
 
-        # Bullets
+        # ---- Bullets with glow trail ----
         for b in self.bullets:
-            r = b.rect.move(-int(cam), 0)
-            pygame.draw.rect(s, b.colour, r)
+            bx = int(b.x - cam)
+            by = int(b.y)
+            if b.friendly:
+                # Trail
+                for i in range(1, 5):
+                    tx = bx - int(b.vx * 0.002 * i)
+                    ty = by - int(b.vy * 0.002 * i)
+                    a = 200 - i * 40
+                    blit_glow(s, (tx, ty), 3, b.colour, alpha=a)
+                blit_glow(s, (bx, by), 6, b.colour, alpha=220)
+                pygame.draw.rect(s, WHITE, (bx - 1, by - 1, 2, 2))
+            else:
+                blit_glow(s, (bx, by), 5, b.colour, alpha=180)
+                pygame.draw.rect(s, b.colour, (bx - 1, by - 1, 3, 3))
 
-        # Player
+        # ---- Player ----
         if self.player.alive:
-            draw_robocop(s, int(self.player.x - cam), int(self.player.y),
+            px = int(self.player.x - cam)
+            py = int(self.player.y)
+            draw_robocop(s, px, py,
                          self.player.facing, self.player.phase,
                          self.player.crouching, self.player.iframes > 0)
+            # Muzzle flash
+            if self.player.shoot_cd > 0.10:
+                mf = self.player.facing
+                muz_y = py - (16 if self.player.crouching else 22)
+                muz_x = px + mf * 22
+                blit_glow(s, (muz_x, muz_y), 10, YELLOW, alpha=220)
+                pygame.draw.polygon(s, WHITE, [
+                    (muz_x, muz_y), (muz_x + mf * 6, muz_y - 2),
+                    (muz_x + mf * 8, muz_y), (muz_x + mf * 6, muz_y + 2)])
+            # Punch shockwave
             if self.player.punch_t > 0:
-                px = int(self.player.x - cam) + self.player.facing * 14
-                py = int(self.player.y) - 18
-                pygame.draw.circle(s, WHITE, (px, py), 4)
+                t = self.player.punch_t / 0.35
+                radius = int((1 - t) * 10) + 3
+                ring = pygame.Surface((radius * 2 + 4, radius * 2 + 4), pygame.SRCALPHA)
+                pygame.draw.circle(ring, (255, 255, 255, int(220 * t)),
+                                   (radius + 2, radius + 2), radius, 2)
+                fx = px + self.player.facing * 16
+                fy = py - 22
+                s.blit(ring, (fx - radius - 2, fy - radius - 2))
 
-        # Sparks
+        # ---- Sparks (multi-pixel with fade) ----
         for sp in self.sparks:
-            pygame.draw.rect(s, sp.colour, (int(sp.x - cam), int(sp.y), 2, 2))
+            sx = int(sp.x - cam)
+            sy = int(sp.y)
+            life_n = max(0.0, min(1.0, sp.life * 1.5))
+            size = 1 + int(life_n * 2)
+            blit_glow(s, (sx, sy), 4, sp.colour, alpha=int(life_n * 200))
+            pygame.draw.rect(s, sp.colour, (sx, sy, size, size))
 
-        # HUD
+        # ---- HUD ----
         self._draw_hud(s)
 
     def _draw_hud(self, s: pygame.Surface) -> None:
-        pygame.draw.rect(s, BLACK, (0, 0, W, 18))
-        pygame.draw.line(s, CYAN, (0, 18), (W, 18))
-        # Health
+        # Top bar (translucent)
+        bar = pygame.Surface((W, 30), pygame.SRCALPHA)
+        bar.fill((6, 10, 18, 200))
+        s.blit(bar, (0, 0))
+        pygame.draw.line(s, CYAN, (0, 30), (W, 30))
+        pygame.draw.line(s, (30, 60, 90), (0, 31), (W, 31))
+
+        # Health label + segmented bar with glow
+        lbl = self.font.render("HEALTH", False, CYAN)
+        s.blit(lbl, (8, 4))
         for i in range(self.player.max_hp):
-            col = RED if i < self.player.hp else (40, 40, 50)
-            pygame.draw.rect(s, col, (8 + i * 10, 5, 8, 8))
-        # Stage name
-        img = self.font.render(self.stage.name, False, WHITE)
-        s.blit(img, (W // 2 - img.get_width() // 2, 3))
-        # Timer (below stage name)
+            x = 8 + i * 14
+            y = 16
+            if i < self.player.hp:
+                c = (235, 50, 60) if i < 2 else (255, 180, 60) if i < 4 else (60, 230, 110)
+                blit_glow(s, (x + 5, y + 4), 6, c, alpha=140)
+                pygame.draw.rect(s, c, (x, y, 11, 9))
+                pygame.draw.rect(s, WHITE, (x, y, 11, 2))
+            else:
+                pygame.draw.rect(s, (35, 38, 50), (x, y, 11, 9))
+                pygame.draw.rect(s, (60, 65, 80), (x, y, 11, 1))
+
+        # Stage name with subtle glow
+        name = self.stage.name
+        img = self.big.render(name, False, WHITE)
+        sx = W // 2 - img.get_width() // 2
+        blit_glow(s, (W // 2, 10), 30, CYAN, alpha=80)
+        s.blit(img, (sx, 2))
+
+        # Timer
         t = max(0, int(self.stage_timer))
-        timg = self.font.render(f"TIME {t:03d}", False,
-                                YELLOW if t > 30 else RED)
-        s.blit(timg, (W // 2 - timg.get_width() // 2, 22))
-        # Score / lives
-        sc = self.font.render(f"SCORE {self.score:06d}  x{self.player.lives}",
-                              False, WHITE)
-        s.blit(sc, (W - sc.get_width() - 6, 5))
-        # Weapon
-        wp = self.font.render(f"[{self.player.weapon}]", False, CYAN)
-        s.blit(wp, (8, 22))
+        col = YELLOW if t > 30 else RED
+        timg = self.font.render(f"TIME {t:03d}", False, col)
+        s.blit(timg, (W // 2 - timg.get_width() // 2, 20))
+
+        # Score / lives (right side)
+        sc = self.big.render(f"{self.score:06d}", False, YELLOW)
+        s.blit(sc, (W - sc.get_width() - 8, 2))
+        lv = self.font.render(f"LIVES x{self.player.lives}", False, WHITE)
+        s.blit(lv, (W - lv.get_width() - 8, 20))
+
+        # Weapon panel (top-left under health)
+        wp_y = 36
+        pygame.draw.rect(s, (10, 14, 24), (4, wp_y, 110, 16))
+        pygame.draw.rect(s, CYAN, (4, wp_y, 110, 16), 1)
+        wp_col = {WEAPON_AUTO9: WHITE, WEAPON_TRIPLE: CYAN,
+                  WEAPON_RAPID: YELLOW, WEAPON_COBRA: ORANGE}[self.player.weapon]
+        wp = self.font.render(self.player.weapon, False, wp_col)
+        s.blit(wp, (10, wp_y + 3))
+        # Weapon timer bar
+        if self.player.weapon != WEAPON_AUTO9:
+            f = max(0.0, self.player.weapon_t / WEAPON_DURATION)
+            pygame.draw.rect(s, (40, 40, 60), (70, wp_y + 5, 36, 6))
+            pygame.draw.rect(s, wp_col, (70, wp_y + 5, int(36 * f), 6))
+
+        # Weapon flash announcement
         if self.weapon_flash:
             kind, t = self.weapon_flash
             if int(t * 6) % 2 == 0:
-                img = self.big.render(kind, False, YELLOW)
-                s.blit(img, (W // 2 - img.get_width() // 2, 40))
+                img = self.huge.render(kind, False, YELLOW)
+                blit_glow(s, (W // 2, 80), 40, YELLOW, alpha=160)
+                s.blit(img, (W // 2 - img.get_width() // 2, 60))
         if self.message:
             txt, t = self.message
             if int(t * 4) % 2 == 0:
                 img = self.big.render(txt, False, RED)
-                s.blit(img, (W // 2 - img.get_width() // 2, 60))
+                blit_glow(s, (W // 2, 110), 40, RED, alpha=160)
+                s.blit(img, (W // 2 - img.get_width() // 2, 100))
 
     def _draw_bonus_intro(self, s: pygame.Surface) -> None:
         s.fill(BLACK)
@@ -1198,11 +1769,27 @@ class Game:
             s.blit(img, (W // 2 - img.get_width() // 2, 130 + i * 14))
 
     def _draw_bonus(self, s: pygame.Surface) -> None:
-        s.fill((20, 10, 20))
-        # First-person room
-        pygame.draw.polygon(s, (40, 25, 50),
-                            [(0, 0), (W, 0), (W - 60, H), (60, H)])
-        pygame.draw.rect(s, (60, 40, 70), (40, H - 60, W - 80, 60))
+        gradient_rect(s, pygame.Rect(0, 0, W, H), (15, 8, 25), (40, 18, 50))
+        # First-person alley perspective
+        pygame.draw.polygon(s, (25, 18, 35),
+                            [(0, 0), (W, 0), (W - 80, H), (80, H)])
+        # Side walls bricks
+        for y in range(0, H, 14):
+            for x in range(0, 80, 16):
+                pygame.draw.rect(s, (50, 28, 60), (x + (y // 14) % 2 * 8, y, 14, 12))
+                pygame.draw.rect(s, (80, 45, 95), (x + (y // 14) % 2 * 8, y, 14, 1))
+        for y in range(0, H, 14):
+            for x in range(W - 80, W, 16):
+                pygame.draw.rect(s, (50, 28, 60), (x + (y // 14) % 2 * 8, y, 14, 12))
+                pygame.draw.rect(s, (80, 45, 95), (x + (y // 14) % 2 * 8, y, 14, 1))
+        # Floor
+        gradient_rect(s, pygame.Rect(80, H - 80, W - 160, 80),
+                      (40, 25, 50), (10, 8, 20))
+        pygame.draw.rect(s, (60, 40, 70), (80, H - 80, W - 160, 2))
+        # Streetlamp glow
+        blit_glow(s, (W // 2, 20), 60, (255, 220, 130), alpha=140)
+        pygame.draw.rect(s, (200, 180, 100), (W // 2 - 2, 0, 4, 12))
+
         # Targets
         for t in self.bonus_targets:
             if t["resolved"]:
@@ -1212,28 +1799,63 @@ class Game:
             if self.bonus_t > t["t_appear"] + t["duration"]:
                 continue
             cy = t["y"]
-            # Civilian
-            pygame.draw.rect(s, WHITE, (t["civilian_x"] - 6, cy - 26, 12, 18))
-            pygame.draw.rect(s, (220, 200, 170),
-                             (t["civilian_x"] - 4, cy - 32, 8, 6))
-            # Criminal (behind, with gun)
-            pygame.draw.rect(s, (200, 60, 60), (t["criminal_x"] - 6, cy - 26, 12, 18))
-            pygame.draw.rect(s, (50, 50, 50),
-                             (t["criminal_x"] - 4, cy - 32, 8, 6))
-            pygame.draw.rect(s, GREY, (t["criminal_x"] + 5, cy - 18, 6, 2))
-        # HUD
+            cx_civ = t["civilian_x"]
+            cx_cri = t["criminal_x"]
+            # Civilian (white shirt, scared)
+            sh = pygame.Surface((22, 5), pygame.SRCALPHA)
+            pygame.draw.ellipse(sh, (0, 0, 0, 130), sh.get_rect())
+            s.blit(sh, (cx_civ - 11, cy + 4))
+            pygame.draw.rect(s, (30, 30, 35), (cx_civ - 5, cy - 14, 10, 14))
+            pygame.draw.rect(s, WHITE, (cx_civ - 6, cy - 26, 12, 14))
+            pygame.draw.rect(s, (220, 200, 170), (cx_civ - 4, cy - 34, 8, 8))
+            pygame.draw.rect(s, (180, 140, 100), (cx_civ - 4, cy - 36, 8, 3))
+            # Hands up
+            pygame.draw.rect(s, (220, 200, 170), (cx_civ - 8, cy - 36, 3, 6))
+            pygame.draw.rect(s, (220, 200, 170), (cx_civ + 5, cy - 36, 3, 6))
+
+            # Criminal (red, with gun)
+            sh2 = pygame.Surface((22, 5), pygame.SRCALPHA)
+            pygame.draw.ellipse(sh2, (0, 0, 0, 130), sh2.get_rect())
+            s.blit(sh2, (cx_cri - 11, cy + 4))
+            pygame.draw.rect(s, (30, 30, 35), (cx_cri - 5, cy - 14, 10, 14))
+            pygame.draw.rect(s, (200, 60, 60), (cx_cri - 6, cy - 26, 12, 14))
+            pygame.draw.rect(s, (140, 30, 30), (cx_cri - 6, cy - 26, 12, 2))
+            pygame.draw.rect(s, (220, 200, 170), (cx_cri - 4, cy - 34, 8, 8))
+            pygame.draw.rect(s, (30, 30, 30), (cx_cri - 4, cy - 36, 8, 3))
+            # Bandana / mask
+            pygame.draw.rect(s, BLACK, (cx_cri - 4, cy - 30, 8, 3))
+            # Gun
+            facing = 1 if cx_cri < cx_civ else -1
+            gx = cx_cri + facing * 6
+            pygame.draw.rect(s, (35, 35, 40), (gx, cy - 20, 8, 3))
+            pygame.draw.rect(s, (70, 70, 80), (gx, cy - 20, 8, 1))
+            # Marker triangle above criminal
+            pygame.draw.polygon(s, RED, [(cx_cri, cy - 44), (cx_cri - 4, cy - 50),
+                                         (cx_cri + 4, cy - 50)])
+            blit_glow(s, (cx_cri, cy - 47), 6, RED, alpha=120)
+
+        # HUD bar
+        bar = pygame.Surface((W, 24), pygame.SRCALPHA)
+        bar.fill((0, 0, 0, 180))
+        s.blit(bar, (0, 0))
+        pygame.draw.line(s, CYAN, (0, 24), (W, 24))
         rem = sum(1 for t in self.bonus_targets if not t["resolved"])
         img = self.font.render(f"TARGETS {rem}/{len(self.bonus_targets)}",
                                False, YELLOW)
         s.blit(img, (10, 6))
         sc = self.font.render(f"SCORE {self.score:06d}", False, WHITE)
         s.blit(sc, (W - sc.get_width() - 6, 6))
-        # Crosshair
+        # Crosshair (high-tech)
         cx = self.crosshair[0] // SCALE
         cy = self.crosshair[1] // SCALE
-        pygame.draw.circle(s, CYAN, (cx, cy), 8, 1)
-        pygame.draw.line(s, CYAN, (cx - 12, cy), (cx + 12, cy), 1)
-        pygame.draw.line(s, CYAN, (cx, cy - 12), (cx, cy + 12), 1)
+        blit_glow(s, (cx, cy), 12, CYAN, alpha=100)
+        pygame.draw.circle(s, CYAN, (cx, cy), 10, 1)
+        pygame.draw.circle(s, CYAN, (cx, cy), 16, 1)
+        pygame.draw.line(s, CYAN, (cx - 18, cy), (cx - 6, cy), 1)
+        pygame.draw.line(s, CYAN, (cx + 6, cy), (cx + 18, cy), 1)
+        pygame.draw.line(s, CYAN, (cx, cy - 18), (cx, cy - 6), 1)
+        pygame.draw.line(s, CYAN, (cx, cy + 6), (cx, cy + 18), 1)
+        pygame.draw.rect(s, CYAN, (cx - 1, cy - 1, 2, 2))
         pygame.mouse.set_visible(False)
 
     def _draw_bonus_result(self, s: pygame.Surface) -> None:
@@ -1249,32 +1871,70 @@ class Game:
         self._draw_centre_text(s, "PRESS ENTER", self.font, YELLOW, 60)
 
     def _draw_game_over(self, s: pygame.Surface) -> None:
-        s.fill(BLACK)
-        self._draw_centre_text(s, "GAME OVER", self.huge, RED, -20)
-        self._draw_centre_text(s, f"FINAL SCORE {self.score:06d}", self.font, WHITE, 30)
+        gradient_rect(s, pygame.Rect(0, 0, W, H), (20, 0, 0), (5, 0, 5))
+        # Animated red sparks
+        for i in range(40):
+            sx = (i * 53 + int(self.state_t * 80)) % W
+            sy = (i * 37 + int(math.sin(self.state_t + i) * 20)) % H
+            s.set_at((sx, sy), (180 + (i % 60), 30, 30))
+        img = self.huge.render("GAME OVER", False, RED)
+        blit_glow(s, (W // 2, H // 2 - 30), 80, RED, alpha=180)
+        s.blit(img, (W // 2 - img.get_width() // 2, H // 2 - 60))
+        # Broken robocop
+        sx = W // 2
+        sy = H - 70
+        pygame.draw.rect(s, STEEL_DARK, (sx - 18, sy - 6, 36, 6))  # debris
+        pygame.draw.rect(s, STEEL_MID, (sx - 14, sy - 12, 12, 6))
+        pygame.draw.rect(s, ARMOR_BLUE, (sx + 4, sy - 14, 14, 8))
+        pygame.draw.rect(s, VISOR_GLOW if int(self.state_t * 4) % 3 == 0 else (40, 40, 60),
+                         (sx - 12, sy - 10, 6, 2))
+        sc = self.big.render(f"FINAL SCORE   {self.score:06d}", False, WHITE)
+        s.blit(sc, (W // 2 - sc.get_width() // 2, H // 2 + 30))
         if int(self.state_t * 2) % 2 == 0:
-            self._draw_centre_text(s, "PRESS ENTER", self.font, YELLOW, 60)
+            press = self.font.render("PRESS ENTER TO RESTART", False, YELLOW)
+            s.blit(press, (W // 2 - press.get_width() // 2, H // 2 + 70))
 
     def _draw_ending(self, s: pygame.Surface) -> None:
-        s.fill(BLACK)
-        for i in range(0, H, 4):
-            pygame.draw.line(s, (5, 10, 25), (0, i), (W, i))
-        self._draw_centre_text(s, "DETROIT IS SAFE", self.big, CYAN, -60)
+        gradient_rect(s, pygame.Rect(0, 0, W, H), (5, 10, 35), (40, 5, 60))
+        # Sunrise glow
+        blit_glow(s, (W // 2, H - 90), 120, (255, 180, 80), alpha=120)
+        # City silhouette
+        for i in range(0, W, 22):
+            bh = 40 + ((i * 7) % 80)
+            pygame.draw.rect(s, (10, 12, 25), (i, H - 100 - bh, 20, bh + 100))
+            for wy in range(H - 100 - bh + 6, H - 110, 8):
+                if ((i + wy) // 8) % 4 == 0:
+                    pygame.draw.rect(s, (255, 220, 130), (i + 4, wy, 2, 3))
+
+        # Title
+        t = self.huge.render("DETROIT IS SAFE", False, CYAN)
+        blit_glow(s, (W // 2, 40), 80, CYAN, alpha=150)
+        s.blit(t, (W // 2 - t.get_width() // 2, 20))
+
         # Walking robocop
-        px = int(W * 0.5 + math.sin(self.state_t * 1.5) * 60)
-        draw_robocop(s, px, H - 60, 1, self.state_t * 2, False, False)
+        px = int(W * 0.3 + (self.state_t * 30) % (W * 0.6))
+        # Spotlight follow
+        spot = pygame.Surface((140, 30), pygame.SRCALPHA)
+        pygame.draw.ellipse(spot, (255, 200, 100, 90), spot.get_rect())
+        s.blit(spot, (px - 70, H - 60))
+        draw_robocop(s, px, H - 50, 1, self.state_t * 3, False, False)
+
+        # Story text
         lines = [
             "Dick Jones has been brought to justice.",
             "ED-209 lies in pieces at the foot of OCP tower.",
-            "The streets are quiet, for now.",
-            "",
-            f"FINAL SCORE  {self.score:06d}",
+            "The streets are quiet... for now.",
         ]
         for i, ln in enumerate(lines):
-            img = self.font.render(ln, False, WHITE if i != 4 else YELLOW)
-            s.blit(img, (W // 2 - img.get_width() // 2, 130 + i * 14))
+            img = self.font.render(ln, False, WHITE)
+            s.blit(img, (W // 2 - img.get_width() // 2, 100 + i * 18))
+        # Final score
+        fs = self.big.render(f"FINAL SCORE   {self.score:06d}", False, YELLOW)
+        blit_glow(s, (W // 2, 180), 60, YELLOW, alpha=140)
+        s.blit(fs, (W // 2 - fs.get_width() // 2, 170))
         if int(self.state_t * 2) % 2 == 0:
-            self._draw_centre_text(s, "PRESS ENTER", self.font, MAGENTA, 100)
+            press = self.font.render("PRESS ENTER", False, MAGENTA)
+            s.blit(press, (W // 2 - press.get_width() // 2, 220))
 
     # ------------------------------------------------------------------
     # Main loop
