@@ -180,30 +180,25 @@ def blit_glow(surf: pygame.Surface, pos: tuple[int, int], radius: int,
               special_flags=pygame.BLEND_ADD)
 
 
-def vline_grad(surf: pygame.Surface, x: int, y0: int, y1: int,
-               c0: tuple[int, int, int], c1: tuple[int, int, int]) -> None:
-    if y1 <= y0:
-        return
-    for y in range(y0, y1):
-        t = (y - y0) / max(1, y1 - y0 - 1)
-        c = (int(c0[0] + (c1[0] - c0[0]) * t),
-             int(c0[1] + (c1[1] - c0[1]) * t),
-             int(c0[2] + (c1[2] - c0[2]) * t))
-        surf.set_at((x, y), c)
+_GRAD_CACHE: dict[tuple, pygame.Surface] = {}
 
 
 def gradient_rect(surf: pygame.Surface, rect: pygame.Rect,
                   c0: tuple[int, int, int], c1: tuple[int, int, int]) -> None:
-    h = rect.height
-    strip = pygame.Surface((1, h))
-    for y in range(h):
-        t = y / max(1, h - 1)
-        c = (int(c0[0] + (c1[0] - c0[0]) * t),
-             int(c0[1] + (c1[1] - c0[1]) * t),
-             int(c0[2] + (c1[2] - c0[2]) * t))
-        strip.set_at((0, y), c)
-    strip = pygame.transform.scale(strip, (rect.width, h))
-    surf.blit(strip, rect.topleft)
+    key = (rect.width, rect.height, c0, c1)
+    cached = _GRAD_CACHE.get(key)
+    if cached is None:
+        strip = pygame.Surface((1, rect.height))
+        for y in range(rect.height):
+            t = y / max(1, rect.height - 1)
+            strip.set_at((0, y), (
+                int(c0[0] + (c1[0] - c0[0]) * t),
+                int(c0[1] + (c1[1] - c0[1]) * t),
+                int(c0[2] + (c1[2] - c0[2]) * t),
+            ))
+        cached = pygame.transform.scale(strip, (rect.width, rect.height))
+        _GRAD_CACHE[key] = cached
+    surf.blit(cached, rect.topleft)
 
 
 def draw_robocop(surf: pygame.Surface, x: int, y: int, facing: int,
@@ -519,6 +514,8 @@ class Bullet:
     pierce: bool = False
     colour: tuple[int, int, int] = YELLOW
     size: int = 2
+    gravity: bool = False
+    hit_ids: set = field(default_factory=set)
 
     @property
     def rect(self) -> pygame.Rect:
@@ -621,10 +618,15 @@ class Enemy:
         elif self.kind == "heavy":
             self.cooldown -= dt
             if self.cooldown <= 0 and abs(dx) < 260:
+                shooter = self
                 for i in range(3):
-                    game.delayed.append((0.12 * i, lambda fx=self.x + self.facing * 8,
-                                          fy=self.y - 16, f=self.facing:
-                                         game.spawn_enemy_bullet(fx, fy, f * 180, 0)))
+                    def _shot(g=game, src=shooter, i=i):
+                        if src.dead:
+                            return
+                        g.spawn_enemy_bullet(src.x + src.facing * 8,
+                                             src.y - 16,
+                                             src.facing * 180, 0)
+                    game.delayed.append((0.12 * i, _shot))
                 self.cooldown = 2.4
         elif self.kind == "drone":
             self.x += self.facing * self.speed * dt
@@ -748,6 +750,7 @@ class Player:
         self.alive = True
         self.respawn_t = 0.0
         self.punch_t = 0.0
+        self.muzzle_t = 0.0
 
     @property
     def rect(self) -> pygame.Rect:
@@ -787,6 +790,7 @@ class Player:
         self.shoot_cd = max(0, self.shoot_cd - dt)
         self.iframes = max(0, self.iframes - dt)
         self.punch_t = max(0, self.punch_t - dt)
+        self.muzzle_t = max(0, self.muzzle_t - dt)
 
         if not self.alive:
             self.respawn_t -= dt
@@ -849,8 +853,8 @@ class Player:
     def try_shoot(self, game: "Game") -> None:
         if self.shoot_cd > 0:
             return
-        muzzle_x = self.x + self.facing * 12
-        muzzle_y = self.y - (16 if self.crouching else 18)
+        muzzle_x = self.x + self.facing * 22
+        muzzle_y = self.y - (16 if self.crouching else 22)
         if self.weapon == WEAPON_AUTO9:
             game.bullets.append(Bullet(muzzle_x, muzzle_y,
                                        self.facing * 360, 0, True,
@@ -879,6 +883,8 @@ class Player:
                                        colour=ORANGE, size=3))
             self.shoot_cd = 0.32
             game.audio.play("cobra")
+        # Flash regardless of weapon's cooldown length
+        self.muzzle_t = 0.06
 
     def pick_weapon(self, kind: str, game: "Game") -> None:
         if kind == "health":
@@ -956,7 +962,14 @@ def stage_junkyard() -> Stage:
 
 def stage_ocp() -> Stage:
     palette = ((10, 15, 35), (35, 50, 110), (130, 170, 240))
-    return Stage("OCP HQ", 700, palette, [], boss="ed209")
+    spawns: list[StageSpawn] = []
+    # Sparse goons leading up to the boss arena
+    for x in (300, 480, 660, 820):
+        spawns.append(StageSpawn(x, lambda g, xx=x: g.enemies.append(
+            Enemy(xx, GROUND_Y, "heavy"))))
+    spawns.append(StageSpawn(700, lambda g: g.powerups.append(
+        PowerUp(700, GROUND_Y - 10, "health"))))
+    return Stage("OCP HQ", 1500, palette, spawns, boss="ed209")
 
 
 # ---------------------------------------------------------------------------
@@ -976,36 +989,38 @@ class Game:
         self.audio = Audio()
         self.scanline_overlay = self._build_scanlines()
         self.vignette = self._build_vignette()
+        self.input = {"left": False, "right": False, "down": False,
+                      "jump": False, "shoot": False}
+        self.reset_run()
 
+    def reset_run(self) -> None:
+        """Reset all per-run state without rebuilding window/audio/overlays."""
         self.state = "TITLE"
         self.state_t = 0.0
-
         self.player = Player()
-        self.bullets: list[Bullet] = []
-        self.enemies: list[Enemy] = []
-        self.powerups: list[PowerUp] = []
-        self.sparks: list[Spark] = []
-        self.delayed: list[tuple[float, Callable[[], None]]] = []
+        self.bullets = []
+        self.enemies = []
+        self.powerups = []
+        self.sparks = []
+        self.delayed = []
         self.cam_x = 0.0
         self.score = 0
         self.shake_t = 0.0
         self.shake_amp = 0.0
-        self.weapon_flash: tuple[str, float] | None = None
+        self.weapon_flash = None
         self.stage_index = 0
-        self.stages = [stage_streets(), stage_factory(), stage_junkyard(), stage_ocp()]
+        self.stages = [stage_streets(), stage_factory(),
+                       stage_junkyard(), stage_ocp()]
         self.stage = self.stages[0]
-        self.spawned: set[int] = set()
+        self.spawned = set()
         self.boss_spawned = False
         self.stage_timer = 200.0
-        self.input = {"left": False, "right": False, "down": False,
-                      "jump": False, "shoot": False}
-        self.bonus_targets: list[dict] = []
+        self.bonus_targets = []
         self.bonus_t = 0.0
         self.bonus_score = 0
         self.crosshair = (W // 2, H // 2)
         self.mouse_fired = False
-        self.message: tuple[str, float] | None = None
-
+        self.message = None
         self.start_stage(0)
         self.set_state("TITLE")
 
@@ -1045,6 +1060,8 @@ class Game:
     def set_state(self, s: str) -> None:
         self.state = s
         self.state_t = 0.0
+        # Hide the OS cursor only while the bonus stage is active
+        pygame.mouse.set_visible(s != "BONUS")
 
     def shake(self, amp: float) -> None:
         self.shake_t = 0.25
@@ -1091,20 +1108,28 @@ class Game:
             })
         self.set_state("BONUS")
 
+    def _explode(self, x: float, y: float, colour: tuple[int, int, int],
+                 big: bool = False) -> None:
+        n = 20 if big else 8
+        for _ in range(n):
+            self.sparks.append(Spark(x,
+                                     y - 6,
+                                     random.uniform(-160, 160),
+                                     random.uniform(-180, -40),
+                                     random.uniform(0.4, 0.9),
+                                     random.choice([colour, YELLOW, WHITE])))
+        if big:
+            self.shake(5)
+            self.audio.play("explode")
+
     def spawn_enemy_bullet(self, x: float, y: float, vx: float, vy: float,
                            colour: tuple[int, int, int] = RED,
                            gravity: bool = False) -> None:
-        b = Bullet(x, y, vx, vy, False, colour=colour)
         if gravity:
-            b.life = 3.0
-            b.size = 3
-            b.colour = ORANGE
-            b.damage = 2
-            b.pierce = False
-            b.friendly = False
-            # We'll hack gravity in update via special flag — store on attr
-            b.size = 3
-            setattr(b, "gravity", True)
+            b = Bullet(x, y, vx, vy, friendly=False, damage=2, life=3.0,
+                       colour=ORANGE, size=3, gravity=True)
+        else:
+            b = Bullet(x, y, vx, vy, friendly=False, colour=colour)
         self.bullets.append(b)
 
     # ------------------------------------------------------------------
@@ -1136,9 +1161,9 @@ class Game:
                 elif self.state == "BONUS_RESULT":
                     self._advance_stage()
                 elif self.state == "GAME_OVER":
-                    self.__init__()
+                    self.reset_run()
                 elif self.state == "ENDING":
-                    self.__init__()
+                    self.reset_run()
         if ev.type == pygame.MOUSEBUTTONDOWN and ev.button == 1:
             if self.state == "BONUS":
                 self.mouse_fired = True
@@ -1227,8 +1252,16 @@ class Game:
         for b in self.bullets:
             b.x += b.vx * dt
             b.y += b.vy * dt
-            if getattr(b, "gravity", False):
+            if b.gravity:
                 b.vy += 380 * dt
+                # Explode on ground impact
+                if b.y >= GROUND_Y:
+                    b.life = 0
+                    self._explode(b.x, GROUND_Y, ORANGE, big=True)
+                    if (self.player.alive
+                            and abs(self.player.x - b.x) < 26
+                            and abs(self.player.y - GROUND_Y) < 30):
+                        self.player.take_hit(b.damage, self)
             b.life -= dt
         self.bullets = [b for b in self.bullets if b.life > 0
                         and -50 < (b.x - self.cam_x) < W + 50
@@ -1240,11 +1273,16 @@ class Game:
                 for e in self.enemies:
                     if e.dead:
                         continue
+                    eid = id(e)
+                    if b.pierce and eid in b.hit_ids:
+                        continue
                     if e.rect.collidepoint(b.x, b.y):
                         e.hit(b.damage, self)
-                        if not b.pierce:
+                        if b.pierce:
+                            b.hit_ids.add(eid)
+                        else:
                             b.life = 0
-                        break
+                            break
             else:
                 if self.player.alive and self.player.rect.collidepoint(b.x, b.y):
                     self.player.take_hit(b.damage, self)
@@ -1293,30 +1331,33 @@ class Game:
         cx = self.crosshair[0] // SCALE
         cy = self.crosshair[1] // SCALE
 
-        # Activate targets
+        # Time out expired targets
         for t in self.bonus_targets:
             if t["resolved"]:
                 continue
-            if self.bonus_t < t["t_appear"]:
-                continue
             if self.bonus_t > t["t_appear"] + t["duration"]:
                 t["resolved"] = True
-                continue
-            if self.mouse_fired:
-                # Check criminal hit
+
+        # Process a single shot per click
+        if self.mouse_fired:
+            self.mouse_fired = False
+            self.audio.play("shot")
+            for t in self.bonus_targets:
+                if t["resolved"]:
+                    continue
+                if self.bonus_t < t["t_appear"]:
+                    continue
                 if abs(cx - t["criminal_x"]) < 16 and abs(cy - t["y"] + 16) < 24:
                     t["resolved"] = True
                     t["hit_criminal"] = True
                     self.bonus_score += 500
                     self.score += 500
-                    self.audio.play("shot")
-                elif abs(cx - t["civilian_x"]) < 16 and abs(cy - t["y"] + 16) < 24:
+                    break
+                if abs(cx - t["civilian_x"]) < 16 and abs(cy - t["y"] + 16) < 24:
                     t["resolved"] = True
                     t["hit_civilian"] = True
                     self.audio.play("hit")
-        if self.mouse_fired:
-            self.audio.play("shot")
-            self.mouse_fired = False
+                    break
 
         if self.bonus_t > self.bonus_targets[-1]["t_appear"] + self.bonus_targets[-1]["duration"] + 0.6:
             # Result
@@ -1511,7 +1552,7 @@ class Game:
 
         # Moon / sun (stage 0 moon, stage 1 sun, stage 2 hazy sun, stage 3 floodlight)
         if stage_id == 0:
-            mx = (W - 90 - int(cam * 0.05)) % (W + 200) - 100
+            mx = W - 90
             blit_glow(s, (mx, 60), 30, (210, 220, 240), alpha=90)
             pygame.draw.circle(s, (230, 230, 240), (mx, 60), 14)
             pygame.draw.circle(s, (200, 200, 215), (mx + 4, 57), 12)
@@ -1653,7 +1694,7 @@ class Game:
                          self.player.facing, self.player.phase,
                          self.player.crouching, self.player.iframes > 0)
             # Muzzle flash
-            if self.player.shoot_cd > 0.10:
+            if self.player.muzzle_t > 0:
                 mf = self.player.facing
                 muz_y = py - (16 if self.player.crouching else 22)
                 muz_x = px + mf * 22
@@ -1856,10 +1897,8 @@ class Game:
         pygame.draw.line(s, CYAN, (cx, cy - 18), (cx, cy - 6), 1)
         pygame.draw.line(s, CYAN, (cx, cy + 6), (cx, cy + 18), 1)
         pygame.draw.rect(s, CYAN, (cx - 1, cy - 1, 2, 2))
-        pygame.mouse.set_visible(False)
 
     def _draw_bonus_result(self, s: pygame.Surface) -> None:
-        pygame.mouse.set_visible(True)
         s.fill(BLACK)
         saved, civ = getattr(self, "bonus_summary", (0, 0))
         self._draw_centre_text(s, "BONUS RESULT", self.big, CYAN, -50)
